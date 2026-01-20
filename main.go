@@ -20,6 +20,6 @@ func main() {
 	http.Handle("/leaderboard", enableCORS(leaderboardHandler(lb)))
 	http.Handle("/search", enableCORS(searchHandler(lb)))
 
-	log.Println("🚀 Server running on port", port)
+	log.Println("Server running on port", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
