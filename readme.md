@@ -1,122 +1,191 @@
-## Scalable Leaderboard System with Search & Tie-Aware Ranking (Backend)
+# Scalable Leaderboard System with Search & Tie-Aware Ranking (Backend)
 
-This backend powers a **highly scalable, in-memory leaderboard** with:
+This repository contains the backend for a high-performance, tie-aware leaderboard system designed to handle large user bases with fast ranking, search, and live updates.
 
-- **Tie-aware ranking** (same rating ⇒ same rank group, rank is based on how many users have strictly higher rating)
-- **Fast top-N queries** (e.g. top 50 players)
-- **Real-time rating simulation** to mimic a live, evolving system
-- **Case-insensitive search** by username
-- **CORS-enabled HTTP API** for easy integration with web/mobile frontends
+The project was developed in two stages:
 
-The service is written in **Go** and currently runs as a single in-memory instance, but the design is structured so it can be extended toward more distributed/sharded setups.
+- **Baseline implementation** – focused on correctness, clarity, and correctness of tie-aware ranking.
+- **Optimized million-scale implementation** – refactored to remove global scans and scale efficiently to 1M+ users using minimal structural changes.
 
-The backend is deployed on **Render** and publicly available at:
+The backend is written in Go and currently runs as a single in-memory instance, but the internal data structures are designed to closely mirror how production systems (e.g. Redis sorted sets) work, making future scaling straightforward.
 
-- **Base URL**: `https://matiks-backend-mamw.onrender.com`
+The backend is deployed on Render and publicly available at:
 
----
+**Base URL:**
+ https://matiks-backend-mamw.onrender.com
 
-## Features
-
-- **In-memory leaderboard**
-  - Stores users with `id`, `username`, and `rating`.
-  - Uses arrays to maintain **rating frequency** and a **prefix sum of higher ratings** to compute ranks efficiently.
+## Key Features
 
 - **Tie-aware ranking**
-  - Rank is computed based on **how many users have a strictly higher rating**, so all users with the same rating share the same rank group.
-  - Example: if 10 users have a higher rating than rating `R`, then every user with rating `R` gets rank `11`.
+  - Users with the same rating share the same rank.
+  - Rank is based on how many users have a strictly higher rating.
 
-- **Top-N leaderboard**
-  - Fetch the top `N` players ordered by rating (descending).
-  - Uses the tie-aware rank computation for each entry.
+- **Fast top-N leaderboard queries**
+  - Efficiently fetch top players (e.g. top 50).
 
-- **Username search**
-  - Case-insensitive substring search over usernames.
-  - Returns each matching user with their current rank and rating.
+- **Real-time rating simulation**
+  - Background goroutine simulates continuous rating changes.
 
-- **Continuous rating simulation**
-  - A background goroutine randomly adjusts player ratings every 100ms.
-  - Keeps the leaderboard changing over time, simulating real-world dynamics.
+- **Case-insensitive username search**
+  - Returns live rank and rating for matching users.
 
-- **CORS-enabled API**
-  - `Access-Control-Allow-Origin: *` set on all endpoints to simplify integration from any frontend origin.
+- **CORS-enabled HTTP API**
+  - Ready for web and mobile frontends.
 
----
-
-## High-Level Architecture
+## Technology Stack
 
 - **Language**: Go
-- **Entry point**: `main.go`
-- **Core components**:
-  - `Leaderboard` struct in `leaderboard.go`:
-    - Holds:
-      - `users`: `map[int64]*User`
-      - `usernameIndex`: `map[string][]int64` (for search)
-      - `ratingCount`: frequency of each rating
-      - `higherCount`: prefix sums used to compute ranks
-    - Methods:
-      - `AddUser(u *User)`
-      - `UpdateRating(userID int64, delta int)`
-      - `GetTop(limit int) []LeaderboardEntry`
-      - `Search(query string) []LeaderboardEntry`
-      - `StartRatingSimulation()`
-  - Models in `models.go`:
-    - `User`: `{ id, username, rating }`
-    - `LeaderboardEntry`: `{ rank, username, rating }`
-  - Utility functions in `utils.go`:
-    - `seedUsers(lb *Leaderboard, n int)` – seeds `n` users with random usernames and ratings.
-    - `enableCORS(next http.Handler)` – wraps handlers with CORS headers.
-  - HTTP handlers in `handlers.go`:
-    - `leaderboardHandler(lb *Leaderboard)`
-    - `searchHandler(lb *Leaderboard)`
-
-`main.go` wires everything together:
-
-- Creates a new `Leaderboard` with `NewLeaderboard()`.
-- Seeds it with 10,000 users (`seedUsers(lb, 10000)`).
-- Starts the continuous rating simulation (`lb.StartRatingSimulation()`).
-- Exposes HTTP endpoints `/leaderboard` and `/search`.
+- **Concurrency**: sync.RWMutex
+- **Deployment**: Render
+- **Storage**: In-memory 
 
 ---
 
-## Data Model
+## Version 1 — Baseline Implementation (Correctness-First)
 
-- **User**
-  - `id` (`int64`)
-  - `username` (`string`)
-  - `rating` (`int`)
-  - Ratings are clamped between `minRating = 100` and `maxRating = 5000`.
+### Goal
 
-- **LeaderboardEntry**
-  - `rank` (`int`) – computed via prefix sums over ratings
-  - `username` (`string`)
-  - `rating` (`int`)
+The first version focuses on correct ranking logic, thread safety, and clarity.
+
+This version works well for 10k–50k users and is ideal for validating logic and behavior.
+
+### Architecture (Baseline)
+
+#### Core Data Structures
+
+```go
+users         map[int64]*User
+usernameIndex map[string][]int64
+
+ratingCount [5001]int
+higherCount [5002]int
+```
+
+- **users**: stores all users by ID.
+- **usernameIndex**: supports username search.
+- **ratingCount**: number of users per rating.
+- **higherCount**: prefix sums used to compute ranks.
+
+### Ranking Algorithm (Tie-Aware)
+
+For each rating r:
+
+- `ratingCount[r]` = number of users with rating r
+- `higherCount[r]` = number of users with rating strictly greater than r
+
+**Rank formula:**
+
+```
+rank = higherCount[rating] + 1
+```
+
+This guarantees:
+
+- Same rating ⇒ same rank
+- Rank reflects number of higher-rated users
+
+### Baseline Limitations
+
+While correct, this version has scaling bottlenecks:
+
+| Operation | Complexity | Issue at Scale |
+|-----------|-----------|----------------|
+| Leaderboard fetch | O(N × R) | Scans all users |
+| Search | O(N) | Full scan |
+| Rank recompute | O(R) per update | Unnecessary repetition |
+
+Where:
+
+- **N** = number of users
+- **R** = rating range (100–5000)
+
+These operations become too slow at hundreds of thousands or millions of users.
 
 ---
 
-## Ranking Algorithm (Tie-Aware)
+## Version 2 — Optimized Million-Scale Implementation (Current)
 
-The leaderboard maintains:
+### Goal
 
-- `ratingCount[r]`: number of users with rating `r`
-- `higherCount[r]`: number of users with rating strictly greater than `r`
+Refactor the baseline implementation with minimal changes to support 1M+ users, while preserving correctness and simplicity.
 
-On any rating change or new user:
+No databases, no Redis — only smarter in-memory structures.
 
-1. Update `ratingCount[oldRating]--` and `ratingCount[newRating]++`.
-2. Recompute `higherCount` from `maxRating` down to `minRating`:
-   - `higherCount[r] = totalHigher`
-   - `totalHigher += ratingCount[r]`
-3. A user’s rank is:
+### Key Optimizations
 
-   \[
-   \text{rank} = \text{higherCount}[\text{rating}] + 1
-   \]
+#### 1. Rating Buckets (Critical Change)
 
-This means:
+Instead of scanning all users, users are bucketed by rating:
 
-- All users with the same rating share the same rank number.
-- The rank is stable under concurrent reads because operations are protected with a read/write mutex.
+```go
+ratingBuckets map[int]map[int64]*User
+```
+
+This allows:
+
+- Efficient iteration by rating
+- No global scans for leaderboard queries
+
+#### 2. Prefix-Based Username Index
+
+Instead of substring scanning:
+
+```go
+usernamePrefix map[string][]int64
+```
+
+**Example:**
+
+```
+"r"     → [1, 4, 9]
+"ra"    → [1, 9]
+"rah"   → [1]
+```
+
+Search becomes:
+
+- O(results) instead of O(N)
+- Case-insensitive
+- Instant, even at large scale
+
+#### 3. Incremental Rank Maintenance
+
+Instead of recomputing rank prefixes on every update:
+
+- `higherCount` is updated incrementally
+- Rating updates adjust only affected ranges
+
+This removes unnecessary recomputation loops.
+
+### Architecture (Optimized)
+
+#### Core Data Structures
+
+```go
+users           map[int64]*User
+ratingBuckets   map[int]map[int64]*User
+usernamePrefix  map[string][]int64
+
+ratingCount [5001]int
+higherCount [5002]int
+```
+
+### Complexity After Optimization
+
+| Operation | Complexity |
+|-----------|-----------|
+| Rank lookup | O(1) |
+| Leaderboard fetch | O(R + K) |
+| Search | O(results) |
+| Rating update | O(R) (bounded) |
+| Users supported | 1M+ |
+
+Where:
+
+- **R** = 5000 (fixed rating range)
+- **K** = top-N size (e.g. 50)
+
+This makes performance independent of total user count for reads.
 
 ---
 
@@ -124,75 +193,54 @@ This means:
 
 ### Base URL
 
-- **Production (Render)**: `https://matiks-backend-mamw.onrender.com`
-
----
+**Production:**
+https://matiks-backend-mamw.onrender.com
 
 ### `GET /leaderboard`
 
-**Description**: Fetch the top N users ordered by rating (desc), with tie-aware ranks.
+Fetch the top N users by rating (descending), with tie-aware ranks.
 
-- **Query parameters**:
-  - `limit` (optional, `int`, default `50`): maximum number of entries to return.
+**Query Params**
 
-- **Response** – `200 OK`, JSON array of `LeaderboardEntry`:
+- `limit` (optional, default 50)
 
-```json
-[
-  {
-    "rank": 1,
-    "username": "virat_9999",
-    "rating": 4980
-  },
-  {
-    "rank": 1,
-    "username": "virat_1234",
-    "rating": 4980
-  },
-  {
-    "rank": 3,
-    "username": "rohit_42",
-    "rating": 4950
-  }
-]
-```
-
-**Example request**:
+**Example**
 
 ```bash
 curl "https://matiks-backend-mamw.onrender.com/leaderboard?limit=50"
 ```
 
----
-
-### `GET /search`
-
-**Description**: Search players by username (case-insensitive substring), returning their current ranks and ratings.
-
-- **Query parameters**:
-  - `query` (**required**, `string`): substring to search for in usernames.
-
-- **Response** – `200 OK`, JSON array of `LeaderboardEntry`:
+**Response**
 
 ```json
 [
-  {
-    "rank": 120,
-    "username": "rahul_102",
-    "rating": 3105
-  },
-  {
-    "rank": 467,
-    "username": "rahul_876",
-    "rating": 2650
-  }
+  { "rank": 1, "username": "virat_9999", "rating": 4980 },
+  { "rank": 1, "username": "virat_1234", "rating": 4980 },
+  { "rank": 3, "username": "rohit_42", "rating": 4950 }
 ]
 ```
 
-**Example request**:
+### `GET /search`
+
+Search users by username (case-insensitive).
+
+**Query Params**
+
+- `query` (required)
+
+**Example**
 
 ```bash
 curl "https://matiks-backend-mamw.onrender.com/search?query=rahul"
+```
+
+**Response**
+
+```json
+[
+  { "rank": 120, "username": "rahul_102", "rating": 3105 },
+  { "rank": 467, "username": "rahul_876", "rating": 2650 }
+]
 ```
 
 ---
@@ -201,28 +249,20 @@ curl "https://matiks-backend-mamw.onrender.com/search?query=rahul"
 
 ### Prerequisites
 
-- Go (version from `go.mod`, e.g. Go 1.24+)
+- Go (as specified in go.mod)
 
-### Install dependencies
-
-From the `backend` directory:
+### Run Locally
 
 ```bash
-cd /Users/saivaraprasadgandhe/Developer/matiks/backend
 go mod tidy
-```
-
-### Run locally
-
-```bash
 go run .
 ```
 
-By default the server listens on:
+Server runs on:
 
 - `http://localhost:8080`
 
-You can override the port via the `PORT` environment variable:
+Override port if needed:
 
 ```bash
 PORT=9090 go run .
@@ -230,16 +270,24 @@ PORT=9090 go run .
 
 ---
 
-## Render Deployment
+## Deployment Notes
 
-The backend is deployed to **Render** as a web service:
+- **Deployed on Render**
+- Uses dynamic `PORT` from environment
+- In-memory storage (data resets on restart)
+- Reseeds with 10,000 users on boot
+- Rating simulation restarts automatically
 
-- **URL**: `https://matiks-backend-mamw.onrender.com`
-- **Environment**:
-  - Render automatically injects the `PORT` environment variable.
-  - The app binds to `:${PORT}` in `main.go`.
-- **Build & Run**:
-  - Build command: Render can auto-detect (`go build`).
-  - Start command: `go run .` or `./leaderboard` (depending on your Render configuration).
+---
 
-Since the leaderboard is **in-memory**, deployment restarts will reset the data. The service reseeds itself with 10,000 random users and restarts the rating simulation on each boot.
+## Design Rationale (Interview-Ready)
+
+This project demonstrates:
+
+-  Correct handling of tie-aware ranking
+-  Awareness of algorithmic bottlenecks
+-  Ability to refactor for scale with minimal changes
+-  Clean concurrency handling in Go
+-  A clear migration path to Redis or sharded systems
+
+The optimized in-memory design closely mirrors how Redis Sorted Sets compute ranks, making future production scaling straightforward.
